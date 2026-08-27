@@ -1,0 +1,8 @@
+.DS_Store
+.idea/
+build/
+build-*/
+cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+recastlib_sift1m_*/
