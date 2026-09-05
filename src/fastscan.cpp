@@ -194,9 +194,8 @@ class FusedIntervalAccumulator {
       throw std::invalid_argument("invalid fused interval selection parameters");
     }
     if (max_candidates_ > 0) {
-      // The online reservoir follows Faiss's fuzzy-partition pattern. Growing
-      // to 2R amortizes nth_element; each partition keeps 1.5R, while finish()
-      // performs the one exact shrink to R.
+      // Growing to 2R amortizes partitioning. Each fuzzy shrink retains an
+      // exact rank prefix in [R,1.5R]; finish() performs one exact shrink to R.
       reservoir_capacity_ = 2 * max_candidates_;
       // One 16-lane append may cross the shrink boundary. The extra tile avoids
       // splitting that mask and is discarded by the immediate fuzzy shrink.
@@ -417,9 +416,9 @@ class FusedIntervalAccumulator {
 
   void shrink_if_full() {
     if (max_candidates_ == 0 || reservoir_size_ < reservoir_capacity_) return;
-    const size_t fuzzy_keep = max_candidates_ +
+    const size_t fuzzy_max = max_candidates_ +
         (reservoir_capacity_ - max_candidates_) / 2;
-    shrink_shortlist(fuzzy_keep);
+    fuzzy_shrink_shortlist(max_candidates_, fuzzy_max);
   }
 
 #if RECAST_COMPILE_POSTPROCESS_AVX512
@@ -445,10 +444,8 @@ class FusedIntervalAccumulator {
                                          VectorId* ids,
                                          size_t count,
                                          float threshold_estimate,
-                                         VectorId threshold_id) {
-    // Compact the companion SoA planes with one shared lane mask. The <= tie
-    // comparison includes the selected threshold row itself. With unique IDs,
-    // exactly `keep` rows survive the threshold produced by nth_element.
+                                         VectorId threshold_id,
+                                         bool include_equal) {
     size_t read = 0;
     size_t write = 0;
     const __m512 threshold = _mm512_set1_ps(threshold_estimate);
@@ -462,9 +459,11 @@ class FusedIntervalAccumulator {
           reinterpret_cast<const void*>(ids + read));
       __mmask16 keep = _mm512_cmp_ps_mask(
           current_estimates, threshold, _CMP_LT_OQ);
-      const __mmask16 equal = _mm512_cmp_ps_mask(
-          current_estimates, threshold, _CMP_EQ_OQ);
-      keep |= equal & _mm512_cmple_epu32_mask(current_ids, threshold_ids);
+      if (include_equal) {
+        const __mmask16 equal = _mm512_cmp_ps_mask(
+            current_estimates, threshold, _CMP_EQ_OQ);
+        keep |= equal & _mm512_cmple_epu32_mask(current_ids, threshold_ids);
+      }
       _mm512_mask_compressstoreu_ps(
           estimates + write, keep, current_estimates);
       _mm512_mask_compressstoreu_ps(
@@ -475,7 +474,7 @@ class FusedIntervalAccumulator {
     }
     for (; read < count; ++read) {
       if (estimates[read] < threshold_estimate ||
-          (estimates[read] == threshold_estimate &&
+          (include_equal && estimates[read] == threshold_estimate &&
            ids[read] <= threshold_id)) {
         estimates[write] = estimates[read];
         uncertainties[write] = uncertainties[read];
@@ -536,6 +535,44 @@ class FusedIntervalAccumulator {
   }
 #endif
 
+  void fuzzy_shrink_shortlist(size_t q_min, size_t q_max) {
+    if (reservoir_size_ <= q_max) return;
+    const detail::FuzzyRankThreshold threshold =
+        detail::find_fuzzy_rank_threshold(
+            estimates_.data(), ids_.data(), reservoir_size_, q_min, q_max,
+            &fuzzy_value_scratch_, &fuzzy_id_scratch_);
+    admission_threshold_estimate_ = threshold.estimate;
+    admission_threshold_id_ = threshold.id;
+    has_admission_threshold_ = true;
+
+#if RECAST_COMPILE_POSTPROCESS_AVX512
+    if (detail::exact_pq4_avx512_supported()) {
+      reservoir_size_ = compact_threshold_avx512(
+          estimates_.data(), uncertainties_.data(), ids_.data(),
+          reservoir_size_, admission_threshold_estimate_,
+          admission_threshold_id_, threshold.equal_to_keep > 0);
+    } else
+#endif
+    {
+      size_t write = 0;
+      for (size_t read = 0; read < reservoir_size_; ++read) {
+        if (estimates_[read] < admission_threshold_estimate_ ||
+            (threshold.equal_to_keep > 0 &&
+             estimates_[read] == admission_threshold_estimate_ &&
+             ids_[read] <= admission_threshold_id_)) {
+          estimates_[write] = estimates_[read];
+          uncertainties_[write] = uncertainties_[read];
+          ids_[write] = ids_[read];
+          ++write;
+        }
+      }
+      reservoir_size_ = write;
+    }
+    if (reservoir_size_ != threshold.output_size) {
+      throw std::logic_error("fuzzy reservoir compaction size mismatch");
+    }
+  }
+
   void shrink_shortlist(size_t keep) {
     if (reservoir_size_ <= keep) return;
     // Partition only compact rank keys. The resulting K-th key defines an exact
@@ -558,7 +595,7 @@ class FusedIntervalAccumulator {
       reservoir_size_ = compact_threshold_avx512(
           estimates_.data(), uncertainties_.data(), ids_.data(),
           reservoir_size_, admission_threshold_estimate_,
-          admission_threshold_id_);
+          admission_threshold_id_, true);
     } else
 #endif
     {
@@ -616,6 +653,8 @@ class FusedIntervalAccumulator {
   std::vector<float> uncertainties_;            // SoA plane 1.
   std::vector<VectorId> ids_;                    // SoA plane 2.
   std::vector<uint64_t> rank_keys_;              // Scratch for nth_element.
+  std::vector<float> fuzzy_value_scratch_;
+  std::vector<VectorId> fuzzy_id_scratch_;
 
   // Worst retained (estimate,id) from the latest reservoir partition. This is
   // an online admission accelerator; finish() still performs an exact top-R.

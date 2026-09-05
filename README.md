@@ -49,7 +49,7 @@ Required:
 
 Linux additionally uses:
 
-- OpenBLAS (preferred and required by the default Dragonfruit configuration)
+- OpenBLAS (preferred for Linux builds)
 - `libaio` development headers and library
 
 On macOS, Homebrew packages are sufficient:
@@ -103,6 +103,7 @@ nlist          1024
 nprobe         64
 Recast M       50 (28 bytes/vector including metadata)
 z              1
+max candidates 2000
 query threads  8
 ```
 
@@ -117,7 +118,8 @@ OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 ./build/recastlib_test \
 ```
 
 The program reports training time, indexing time, Recall@10, QPS, scanned
-vectors/query, refined vectors/query, pages/query, and read requests/query.
+vectors/query, refined vectors/query, QUIC time/query, pages/query, and read
+requests/query.
 It creates a temporary external-list store and removes it on exit. The portable
 test uses ordinary page-aligned file reads rather than O_DIRECT, so its QPS is a
 functional smoke-test number, not a paper benchmark.

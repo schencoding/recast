@@ -30,6 +30,7 @@ constexpr size_t kNlist = 1024;
 constexpr size_t kNprobe = 64;
 constexpr size_t kSubquantizers = 50;
 constexpr size_t kTopK = 10;
+constexpr size_t kMaxCandidates = 2000;
 constexpr float kZScore = 1.0f;
 constexpr int kThreads = 8;
 
@@ -98,7 +99,7 @@ void print_usage(const char* executable) {
          " --query <sift_query.{fvecs,bvecs}>"
          " --groundtruth <sift_groundtruth.ivecs>\n\n"
       << "The integration test always uses 8 threads, top-10, nlist=1024, "
-         "nprobe=64, M=50, and z=1.\n";
+         "nprobe=64, M=50, z=1, and max_candidates=2000.\n";
 }
 
 Arguments parse_arguments(int argc, char** argv) {
@@ -339,7 +340,7 @@ int main(int argc, char** argv) {
       throw std::runtime_error("OpenMP did not create the required 8 threads");
     }
     std::cout << "Configuration: threads=8, topk=10, nlist=1024, nprobe=64, "
-                 "M=50, z=1, max_candidates=unbounded\n";
+                 "M=50, z=1, max_candidates=2000\n";
 
     const auto load_begin = Clock::now();
     Vectors learn = read_vectors(arguments.learn);
@@ -418,7 +419,7 @@ int main(int argc, char** argv) {
     for (int64_t qi = 0; qi < static_cast<int64_t>(warmup); ++qi) {
       index.search(
           query.values.data() + static_cast<size_t>(qi) * kDimension,
-          kTopK, kNprobe, kZScore, 0, distance_function);
+          kTopK, kNprobe, kZScore, kMaxCandidates, distance_function);
     }
 
     std::atomic<bool> failed{false};
@@ -429,22 +430,25 @@ int main(int argc, char** argv) {
     uint64_t refined = 0;
     uint64_t pages = 0;
     uint64_t requests = 0;
+    uint64_t quic_nanoseconds = 0;
     const auto search_begin = Clock::now();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(kThreads) \
-    reduction(+ : hits, scanned, refined, pages, requests)
+    reduction(+ : hits, scanned, refined, pages, requests, quic_nanoseconds)
     for (int64_t qi = 0; qi < static_cast<int64_t>(query.rows); ++qi) {
       if (failed.load(std::memory_order_relaxed)) continue;
       try {
         recastlib::adapters::ExternalListSearchStats stats;
         const std::vector<recastlib::Neighbor> result = index.search(
             query.values.data() + static_cast<size_t>(qi) * kDimension,
-            kTopK, kNprobe, kZScore, 0, distance_function, &stats);
+            kTopK, kNprobe, kZScore, kMaxCandidates,
+            distance_function, &stats);
         hits += recall_hits(
             result, groundtruth.ids.data() + static_cast<size_t>(qi) * kTopK);
         scanned += stats.scan.valid_codes;
         refined += stats.refine.refined_vectors;
         pages += stats.refine.unique_pages;
         requests += stats.refine.read_requests;
+        quic_nanoseconds += stats.scan.postprocess_nanoseconds;
       } catch (const std::exception& error) {
         failed.store(true, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(error_mutex);
@@ -466,6 +470,8 @@ int main(int argc, char** argv) {
               << "QPS: " << qps << '\n'
               << "Mean scanned/query: " << scanned / denominator << '\n'
               << "Mean refined/query: " << refined / denominator << '\n'
+              << "Mean QUIC time/query (us): "
+              << quic_nanoseconds / denominator / 1000.0 << '\n'
               << "Mean pages/query: " << pages / denominator << '\n'
               << "Mean read requests/query: " << requests / denominator << '\n';
     return 0;

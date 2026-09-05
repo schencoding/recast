@@ -46,12 +46,12 @@ endif()
 
 find_package(Threads REQUIRED)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT DEFINED BLA_VENDOR)
-  # Avoid accidentally linking CentOS's slow reference libblas.
+  # Prefer OpenBLAS over an unoptimized reference BLAS implementation.
   set(BLA_VENDOR OpenBLAS)
 endif()
 find_package(BLAS REQUIRED)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # Dragonfruit's OpenBLAS exports the LAPACK entry points used by Faiss.
+  # OpenBLAS provides the LAPACK entry points used by Faiss.
   set(RECASTLIB_MATH_LIBRARIES ${BLAS_LIBRARIES})
 else()
   find_package(LAPACK REQUIRED)
